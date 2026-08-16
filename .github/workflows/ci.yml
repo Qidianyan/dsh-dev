@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Python 语法检查
+        run: python3 -m py_compile scripts/dshdev
+
+      - name: CLI --help 冒烟
+        run: ./scripts/dshdev --help
+
+      - name: doctor 离线降级
+        run: ./scripts/dshdev doctor
+
+      - name: mcp-snippet 两种形态（无 PyYAML 时走 JSON 输出）
+        run: |
+          ./scripts/dshdev mcp-snippet github --command "npx -y @modelcontextprotocol/server-github"
+          ./scripts/dshdev mcp-snippet web --url http://localhost:3000/mcp
+
+      - name: preset-check 对不存在的 preset 必须非零退出
+        run: |
+          set +e
+          out=$(./scripts/dshdev preset-check no-such-preset 2>&1)
+          code=$?
+          set -e
+          [ "$code" -ne 0 ] || { echo "should fail"; exit 1; }
+          echo "$out" | grep -q "本地不存在" || { echo "missing friendly error"; exit 1; }
+
+      - name: plugin-new 脚手架结构
+        run: |
+          ./scripts/dshdev plugin-new dsh-ci-plugin --dir /tmp/dsh-ci-plugin
+          test -f /tmp/dsh-ci-plugin/package.json
+          test -f /tmp/dsh-ci-plugin/cordis.patch.yml
+          test -f /tmp/dsh-ci-plugin/index.js
+          grep -q '"bundle"' /tmp/dsh-ci-plugin/package.json
+
+      - name: install.sh 语法检查
+        run: sh -n install.sh

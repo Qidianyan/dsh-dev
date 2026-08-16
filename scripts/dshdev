@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""dshdev — DeepSeek Harness (dsh) 扩展开发脚手架。
+
+面向 agent preset 与插件 bundle 的创建、校验与检查。所有命令零第三方依赖；
+YAML 深校验在安装了 PyYAML 时自动启用。
+
+用法: dshdev <命令> [参数]        (dshdev help 查看全部)
+环境变量 DSH_URL 覆盖运行中 Host 地址（默认 http://127.0.0.1:3080）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import shutil
+import sys
+import urllib.error
+import urllib.request
+
+BASE = os.environ.get("DSH_URL", "http://127.0.0.1:3080")
+DSH_HOME = os.environ.get("DSH_HOME", os.path.expanduser("~/.dsh"))
+PRESETS_DIR = os.path.join(DSH_HOME, ".agent-presets")
+
+
+class DevError(Exception):
+    """脚手架或检查失败。"""
+
+
+try:
+    import yaml  # type: ignore[import-not-found]
+
+    HAVE_YAML = True
+
+    class DshYamlLoader(yaml.SafeLoader):
+        """SafeLoader + cordis 的 !!js 扩展标签（值在本地校验中不可求值，置 None 保结构）。"""
+
+    DshYamlLoader.add_constructor("tag:yaml.org,2002:js", lambda _loader, _node: None)
+except ImportError:
+    HAVE_YAML = False
+
+
+# 内置 minimal preset 模板（离线 fallback；在线时优先从运行实例拉取真实内容）
+MINIMAL_TEMPLATE = """# 由 dshdev 生成的 agent preset（基于 minimal 模板）。
+# 修改 persona 文本，增删工具行；发布型服务行必须放进带 isolate realm 的组。
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |-
+      You are a helpful assistant. （在这里写这个 Agent 的人设、职责、约束与工作方式）
+    complete: true
+    includeRuntimeContext: false
+
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      config:
+        timeoutMs: 300000
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      config:
+        timeoutMs: 300000
+
+- id: filesystem
+  name: cordis:group
+  group: true
+  isolate:
+    fs: true
+  config:
+    - id: fs-local
+      name: '@deepseek-ai/dsh-fs-local'
+      config:
+        cwd: !!js process.env.DSH_CWD ?? process.cwd()
+
+    - id: str-replace-editor
+      name: '@deepseek-ai/dsh-tool-str-replace-editor'
+      config:
+        maxOutputChars: 16000
+"""
+
+
+def rpc(method: str, payload: dict):
+    body = json.dumps(
+        {"type": "client-request", "rpcId": "dshdev", "method": method, "payload": payload}
+    ).encode()
+    req = urllib.request.Request(
+        f"{BASE}/api/{method}", data=body, headers={"content-type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        result = json.load(resp)["result"]
+    if not result.get("ok"):
+        err = result.get("error", {})
+        raise DevError(f"{err.get('code', 'internal')}: {err.get('message', '')}")
+    return result.get("value")
+
+
+def host_online() -> bool:
+    try:
+        rpc("host.describe", {})
+        return True
+    except (urllib.error.URLError, DevError):
+        return False
+
+
+# ── doctor ───────────────────────────────────────────────────────────────
+
+
+def cmd_doctor(_args) -> None:
+    print(f"DSH_HOME   {DSH_HOME}{'（存在）' if os.path.isdir(DSH_HOME) else '（不存在）'}")
+    print(f"presets    {PRESETS_DIR}{'（存在）' if os.path.isdir(PRESETS_DIR) else '（不存在；preset-new 会创建）'}")
+    online = host_online()
+    print(f"dsh Host   {BASE} {'在线' if online else '离线（在线功能降级）'}")
+    if online:
+        v = rpc("host.describe", {})
+        print(f"           版本 {v.get('version')}，默认模型 {v.get('provider')}/{v.get('model')}")
+    print(f"PyYAML     {'可用（YAML 深校验启用）' if HAVE_YAML else '不可用（仅结构检查；pip install pyyaml 启用）'}")
+    for tool in ("node", "pnpm", "dshctl"):
+        path = shutil.which(tool)
+        print(f"{tool:<10} {path or '未安装'}")
+
+
+# ── preset ───────────────────────────────────────────────────────────────
+
+
+def cmd_preset_new(args) -> None:
+    pid = args.id
+    if not pid or not pid.replace("-", "").replace("_", "").isalnum():
+        raise DevError("preset id 只能含字母/数字/-/_")
+    dest = os.path.join(PRESETS_DIR, pid)
+    if os.path.exists(dest):
+        raise DevError(f"已存在 {dest}（先删除或换个 id）")
+
+    content = None
+    if args.preset_from != "minimal" or not args.offline:
+        try:
+            v = rpc("agentPreset.read", {"agentPreset": args.preset_from})
+            content = v["content"]
+            print(f"已从运行实例拉取 {args.preset_from} 的真实组合")
+        except (urllib.error.URLError, DevError) as e:
+            if args.preset_from != "minimal":
+                raise DevError(f"无法从运行实例读取 {args.preset_from}（{e}）；离线仅支持 minimal 模板")
+            print("运行实例不可达，使用内置 minimal 模板")
+    if content is None:
+        content = MINIMAL_TEMPLATE
+
+    os.makedirs(os.path.join(dest, "skills"), exist_ok=True)
+    with open(os.path.join(dest, "preset.yml"), "w") as f:
+        f.write(f"name: {args.name or pid}\n")
+        desc = args.desc or f"{args.name or pid} agent preset（由 dshdev 生成）"
+        f.write(f"description: {desc}\n")
+    with open(os.path.join(dest, "agent.cordis.yml"), "w") as f:
+        f.write(content)
+
+    print(f"已创建 {dest}")
+    print(f"preset.yml        显示名与描述（网页端模式列表可见）")
+    print(f"agent.cordis.yml  组合本体（persona + 工具行）")
+    print(f"skills/           该 preset 私有技能（可空）")
+    print(f"下一步：编辑 persona 后 dshdev preset-check {pid}，然后网页端或 dshctl new -p {pid} 使用")
+
+
+def local_presets() -> list[str]:
+    if not os.path.isdir(PRESETS_DIR):
+        return []
+    return sorted(
+        d for d in os.listdir(PRESETS_DIR)
+        if os.path.isdir(os.path.join(PRESETS_DIR, d)) and not d.startswith(".")
+    )
+
+
+def cmd_preset_list(args) -> None:
+    local = local_presets()
+    print("本地（~/.dsh/.agent-presets/）：")
+    if not local:
+        print("  （空）")
+    for p in local:
+        meta = ""
+        meta_path = os.path.join(PRESETS_DIR, p, "preset.yml")
+        if HAVE_YAML and os.path.isfile(meta_path):
+            try:
+                with open(meta_path) as f:
+                    y = yaml.load(f, Loader=DshYamlLoader) or {}
+                meta = f"  {y.get('name', '?')} — {str(y.get('description', ''))[:50]}"
+            except yaml.YAMLError:
+                meta = "  ⚠️ preset.yml YAML 解析失败"
+        print(f"  {p}{meta}")
+    if host_online():
+        v = rpc("agentPreset.list", {})
+        print("\n运行实例（含系统 preset，●=默认）：")
+        for e in v.get("presets", []):
+            mark = "●" if e.get("isDefault") else " "
+            broken = f"  ⚠️ {e['broken']}" if e.get("broken") else ""
+            print(f"{mark} {e['id']:<18} {e.get('name', '')}{broken}")
+    else:
+        print("\n（运行实例离线，跳过在线列表）")
+    if args.json:
+        print(json.dumps({"local": local}, ensure_ascii=False))
+
+
+def cmd_preset_check(args) -> None:
+    pid = args.id
+    dest = os.path.join(PRESETS_DIR, pid)
+    problems: list[str] = []
+    if not os.path.isdir(dest):
+        raise DevError(f"本地不存在 {dest}（系统 preset 无需检查；此命令检查本地创作）")
+    for name in ("preset.yml", "agent.cordis.yml"):
+        path = os.path.join(dest, name)
+        if not os.path.isfile(path):
+            problems.append(f"缺少 {name}")
+        elif HAVE_YAML:
+            try:
+                with open(path) as f:
+                    list(yaml.load_all(f, Loader=DshYamlLoader))
+            except yaml.YAMLError as e:
+                problems.append(f"{name} YAML 解析失败: {e}")
+    if not os.path.isfile(os.path.join(dest, "agent.cordis.yml")):
+        print("结论: 不通过")
+        for p in problems:
+            print(f"  - {p}")
+        return
+    with open(os.path.join(dest, "agent.cordis.yml")) as f:
+        content = f.read()
+    if "isolate" not in content and any(
+        line.strip().startswith("- id:") and "persona" not in line and "instructions" not in line
+        for line in content.splitlines()
+    ):
+        print("提示: 组合中有服务行但未见 isolate realm——发布型服务必须放进 isolate 组（否则挂载被拒）")
+    if host_online():
+        v = rpc("agentPreset.list", {})
+        entry = next((e for e in v.get("presets", []) if e["id"] == pid), None)
+        if entry is None:
+            problems.append("运行实例未发现该 preset（新建后需刷新；或文件有加载错误）")
+        elif entry.get("broken"):
+            problems.append(f"运行实例报告 broken: {entry['broken']}")
+        else:
+            print(f"运行实例: 已加载（trust={entry.get('trust')}），可 dshctl new -p {pid} 使用")
+    else:
+        print("（运行实例离线，跳过在线校验）")
+    if problems:
+        print("结论: 不通过")
+        for p in problems:
+            print(f"  - {p}")
+        raise DevError("preset-check 发现问题")
+    print("结论: 通过")
+
+
+# ── plugin bundle ────────────────────────────────────────────────────────
+
+PLUGIN_JS = """/** dsh 插件：注册即生效，卸载自动清理。官方教程:
+ * https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/index.md
+ */
+export const name = '{name}'
+
+export function apply(ctx) {{
+  console.log('[{name}] plugin loaded!')
+  // 在此注册能力。示例（需在文件头声明 export const inject = ['tools']）:
+  // ctx.tools.register(defineTool({{ ... }}))   // 模型可见工具
+  // ctx.on('tools/pre-execute', async (exec, next) => next())  // 策略钩子
+}}
+"""
+
+PLUGIN_PACKAGE = """{{
+  "name": "{pkg}",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "index.js",
+  "files": ["index.js", "cordis.patch.yml"],
+  "dsh": {{ "bundle": {{ "patch": "./cordis.patch.yml" }} }}
+}}
+"""
+
+PLUGIN_PATCH = """# 该 bundle 被加入 profile 时应用的层：插入/覆盖插件行。
+# 行的 name 用包名（Node 解析找到安装后的代码），不是文件路径。
+- insert:
+    - id: {row_id}
+      name: {pkg}
+"""
+
+PLUGIN_README = """# {pkg}
+
+DeepSeek Harness (dsh) 插件 bundle。安装:
+
+```sh
+dsh plugin --profile web add {origin}
+dsh --profile web --dump-config   # 应看到 {row_id} 层
+dsh web                            # 启动时打印 [{name}] plugin loaded!
+```
+
+开发: 编辑 `index.js` 后重启 profile。删除: `dsh plugin --profile web remove {pkg}`。
+官方教程: https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/develop/basic/publish.md
+"""
+
+
+def cmd_plugin_new(args) -> None:
+    pkg = args.name
+    if not pkg:
+        raise DevError("需要包名，如 dsh-hello-plugin")
+    dest = os.path.abspath(os.path.expanduser(args.dir or pkg))
+    if os.path.exists(dest):
+        raise DevError(f"目录已存在 {dest}")
+    row_id = pkg.split("/")[-1].removeprefix("dsh-").replace("-", "-")
+    origin = f"./{os.path.basename(dest)}"
+    os.makedirs(dest)
+    with open(os.path.join(dest, "index.js"), "w") as f:
+        f.write(PLUGIN_JS.format(name=pkg.removeprefix("dsh-").replace("-", "-")))
+    with open(os.path.join(dest, "package.json"), "w") as f:
+        f.write(PLUGIN_PACKAGE.format(pkg=pkg))
+    with open(os.path.join(dest, "cordis.patch.yml"), "w") as f:
+        f.write(PLUGIN_PATCH.format(row_id=row_id, pkg=pkg))
+    with open(os.path.join(dest, "README.md"), "w") as f:
+        f.write(PLUGIN_README.format(pkg=pkg, row_id=row_id, name=pkg.removeprefix("dsh-").replace("-", "-"), origin=origin))
+    print(f"已创建零构建 JS 插件 {dest}")
+    print("安装验证:")
+    print(f"  cd {os.path.dirname(dest)} && dsh plugin --profile web add {origin}")
+    print(f"  dsh --profile web --dump-config | grep {row_id}")
+
+
+# ── mcp ──────────────────────────────────────────────────────────────────
+
+
+def cmd_mcp_snippet(args) -> None:
+    name = args.server_name
+    if args.url:
+        row = {
+            "id": f"mcp-{name}",
+            "name": "@deepseek-ai/dsh-mcp-client",
+            "config": {"serverName": name, "transport": "streamable-http", "url": args.url},
+        }
+    elif args.stdio_command:
+        argv = shlex.split(args.stdio_command)
+        if not argv:
+            raise DevError("--command 不能为空")
+        row = {
+            "id": f"mcp-{name}",
+            "name": "@deepseek-ai/dsh-mcp-client",
+            "config": {
+                "serverName": name,
+                "transport": "stdio",
+                "command": argv[0],
+                "args": argv[1:],
+            },
+        }
+    else:
+        raise DevError("需要 --url <地址> 或 --command '<完整命令>'")
+    print("# 追加到 profile 的 cordis.patch.yml（~/.dsh/profiles/web/cordis.patch.yml）")
+    print("# 或 preset 的 agent.cordis.yml；模型将以 mcp__" + name + "__<tool> 形式看到工具")
+    print(yaml.safe_dump([row], allow_unicode=True, sort_keys=False) if HAVE_YAML else json.dumps([row], ensure_ascii=False, indent=2))
+
+
+# ── 入口 ─────────────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="dshdev", description="dsh 扩展开发脚手架（agent preset / 插件 bundle / MCP）")
+    sub = p.add_subparsers(dest="command", metavar="<命令>")
+
+    s = sub.add_parser("doctor", help="环境检查")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("preset-new", help="创建本地 agent preset 脚手架")
+    s.add_argument("id", help="preset id（目录名，如 my-analyst）")
+    s.add_argument("--name", help="显示名（默认 id）")
+    s.add_argument("--desc", help="描述（网页端模式列表显示）")
+    s.add_argument("--from", dest="preset_from", default="minimal", help="基模板: minimal(默认)/standard/code/cordis（在线拉取）")
+    s.add_argument("--offline", action="store_true", help="强制使用内置模板")
+    s.set_defaults(fn=cmd_preset_new)
+
+    s = sub.add_parser("preset-list", help="列出本地与运行实例的 preset")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_preset_list)
+
+    s = sub.add_parser("preset-check", help="检查本地 preset（结构/YAML/运行实例加载状态）")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_preset_check)
+
+    s = sub.add_parser("plugin-new", help="创建零构建插件 bundle 脚手架")
+    s.add_argument("name", help="npm 包名，如 dsh-hello-plugin")
+    s.add_argument("--dir", help="目标目录（默认 ./<name>）")
+    s.set_defaults(fn=cmd_plugin_new)
+
+    s = sub.add_parser("mcp-snippet", help="生成 MCP server 接入 YAML 片段")
+    s.add_argument("server_name", help="工具命名空间，如 github")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--command", dest="stdio_command", help='stdio 完整命令，如 "npx -y @modelcontextprotocol/server-github"')
+    g.add_argument("--url", help="streamable-http 服务地址")
+    s.set_defaults(fn=cmd_mcp_snippet)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 2
+    try:
+        args.fn(args)
+    except DevError as e:
+        print(f"dshdev: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
