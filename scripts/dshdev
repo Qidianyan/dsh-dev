@@ -357,6 +357,124 @@ def cmd_mcp_snippet(args) -> None:
     print(yaml.safe_dump([row], allow_unicode=True, sort_keys=False) if HAVE_YAML else json.dumps([row], ensure_ascii=False, indent=2))
 
 
+
+
+# ── pack factory（DoneOS 行业包） ────────────────────────────────────────
+
+PACK_USAGE_TMPL = """# {name} 使用说明（USAGE）
+
+本包是 DoneOS 行业包：团队 preset + skills + runbooks + 本说明。
+
+## 开团队（dsh 会话）
+- 网页端新建会话选择模式「{name}」，或 CLI：`dshctl new <目录> -p {pid}`
+- 团队角色与分工见 preset 描述；对它说目标即可启动工作协议
+
+## 跑流程（runbook）
+- 列出：对会话说「列出可用 runbook」（doneos_runbook 工具）
+- 运行：`运行 runbook {pid}:<流程名>，参数 …`；产物与证据在 <cwd>/doneos/
+
+## 验收
+- 每步 verify 全绿才算完成；证据链 doneos/evidence/*.jsonl
+"""
+
+RUNBOOK_TMPL = """{
+  "id": "{pid}:<flow>:0.1.0",
+  "name": "<流程名>",
+  "description": "<一句话>",
+  "steps": [
+    {
+      "id": "step1",
+      "name": "<步骤名>",
+      "repair_max_attempts": 2,
+      "output_path": "doneos/runs/{{run.id}}/step1.md",
+      "prompt": "<任务指令，可引用 {{inputs.x}} 与 {{run.dir}}；要求把交付物写入 output_path>",
+      "verify": [
+        {{"type": "file-exists", "path": "{{run.dir}}/step1.md", "min_chars": 100}},
+        {{"type": "regex", "path": "{{run.dir}}/step1.md", "pattern": "#", "description": "结构化标题"}}
+      ]
+    }
+  ],
+  "final": {{"deliver": "doneos/deliverables/{{run.id}}"}}
+}}
+"""
+
+def cmd_pack_new(args) -> None:
+    pid = args.id
+    if not pid or not pid.replace("-", "").replace("_", "").isalnum():
+        raise DevError("pack id 只能含字母/数字/-/_")
+    preset_dir = os.path.join(PRESETS_DIR, pid)
+    if os.path.exists(preset_dir):
+        raise DevError(f"已存在 preset {preset_dir}")
+    rb_dir = os.path.join(DSH_HOME, ".doneos", "runbooks")
+    os.makedirs(os.path.join(preset_dir, "skills"), exist_ok=True)
+    os.makedirs(rb_dir, exist_ok=True)
+    name = args.name or pid
+    with open(os.path.join(preset_dir, "preset.yml"), "w") as f:
+        f.write(f"name: {name}\ndescription: {args.desc or name + ' 行业团队（DoneOS 包）'}\n")
+    content = MINIMAL_TEMPLATE if args.offline else None
+    if content is None:
+        try:
+            content = rpc("agentPreset.read", {"agentPreset": args.preset_from})["content"]
+            print(f"已从运行实例拉取 {args.preset_from} 基组合")
+        except Exception as e:
+            if args.preset_from != "minimal":
+                raise DevError(f"无法拉取 {args.preset_from}（{e}）")
+            content = MINIMAL_TEMPLATE
+    with open(os.path.join(preset_dir, "agent.cordis.yml"), "w") as f:
+        f.write(content)
+    with open(os.path.join(preset_dir, "USAGE.md"), "w") as f:
+        f.write(PACK_USAGE_TMPL.format(name=name, pid=pid))
+    with open(os.path.join(preset_dir, "skills", "README.md"), "w") as f:
+        f.write(f"# {name} 角色技能\n\n为每个角色建一个目录：skills/<角色>/SKILL.md（专业知识+工作流+禁忌）。\n")
+    for flow in ("flow-a", "flow-b"):
+        with open(os.path.join(rb_dir, f"{pid}__{flow}.json"), "w") as f:
+            f.write(RUNBOOK_TMPL.replace("{pid}", pid))
+    print(f"已创建行业包 {pid}：")
+    print(f"  preset  {preset_dir}（agent.cordis.yml 改 persona；skills/ 加角色技能）")
+    print(f"  runbook {rb_dir}/{pid}__flow-a.json 等（改成真实流程）")
+    print(f"  使用    {preset_dir}/USAGE.md")
+    print("下一步：dshdev pack-check " + pid)
+
+
+def cmd_pack_check(args) -> None:
+    pid = args.id
+    preset_dir = os.path.join(PRESETS_DIR, pid)
+    problems = []
+    if not os.path.isdir(preset_dir):
+        raise DevError(f"preset 不存在 {preset_dir}")
+    for name in ("preset.yml", "agent.cordis.yml", "USAGE.md"):
+        if not os.path.isfile(os.path.join(preset_dir, name)):
+            problems.append(f"缺少 {name}")
+    rb_dir = os.path.join(DSH_HOME, ".doneos", "runbooks")
+    import glob as _glob
+    books = sorted(_glob.glob(os.path.join(rb_dir, f"{pid}__*.json")))
+    if not books:
+        problems.append(f"无 runbook（{rb_dir}/{pid}__*.json）")
+    for b in books:
+        try:
+            spec = json.load(open(b))
+            for key in ("id", "steps"):
+                if key not in spec: problems.append(f"{os.path.basename(b)} 缺 {key}")
+            for i, st in enumerate(spec.get("steps", [])):
+                for key in ("id", "prompt"):
+                    if key not in st: problems.append(f"{os.path.basename(b)} step[{i}] 缺 {key}")
+                if not st.get("verify"): problems.append(f"{os.path.basename(b)} step {st.get('id', i)} 无 verify")
+        except Exception as e:
+            problems.append(f"{os.path.basename(b)} JSON 解析失败: {e}")
+    print(f"pack {pid}: runbook {len(books)} 本")
+    if host_online():
+        v = rpc("agentPreset.list", {})
+        entry = next((e for e in v.get("presets", []) if e["id"] == pid), None)
+        if entry is None: problems.append("运行实例未发现该 preset")
+        elif entry.get("broken"): problems.append(f"preset broken: {entry['broken']}")
+        else: print(f"运行实例: preset 已加载")
+    if problems:
+        print("结论: 不通过")
+        for p in problems: print(f"  - {p}")
+        raise DevError("pack-check 发现问题")
+    print("结论: 通过")
+
+
 # ── 入口 ─────────────────────────────────────────────────────────────────
 
 
@@ -394,6 +512,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--command", dest="stdio_command", help='stdio 完整命令，如 "npx -y @modelcontextprotocol/server-github"')
     g.add_argument("--url", help="streamable-http 服务地址")
     s.set_defaults(fn=cmd_mcp_snippet)
+
+    s = sub.add_parser("pack-new", help="创建 DoneOS 行业包（preset+skills+runbooks+USAGE）")
+    s.add_argument("id", help="包/preset id，如 doneos-ecommerce")
+    s.add_argument("--name", help="显示名")
+    s.add_argument("--desc", help="描述")
+    s.add_argument("--from", dest="preset_from", default="minimal", help="基模板（在线拉取，默认 minimal）")
+    s.add_argument("--offline", action="store_true")
+    s.set_defaults(fn=cmd_pack_new)
+
+    s = sub.add_parser("pack-check", help="校验行业包完整性（preset 加载 + runbook schema + USAGE）")
+    s.add_argument("id")
+    s.set_defaults(fn=cmd_pack_check)
 
     return p
 
