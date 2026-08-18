@@ -455,8 +455,8 @@ def cmd_pack_check(args) -> None:
             spec = json.load(open(b))
             for key in ("id", "steps"):
                 if key not in spec: problems.append(f"{os.path.basename(b)} 缺 {key}")
-            if not any('{{inputs.' in st.get('prompt', '') for st in spec.get('steps', [])):
-                problems.append(f"{os.path.basename(b)} 所有步骤均无 {{{{inputs.*}}}} 占位符——手册不可参数化（生成缺陷）")
+            if 'inputs' not in spec and not any('{{inputs.' in st.get('prompt', '') for st in spec.get('steps', [])):
+                problems.append(f"{os.path.basename(b)} 无 inputs 声明且无 {{{{inputs.*}}}} 占位符——不可参数化（零输入手册须显式声明 inputs: {{}}）")
             for i, st in enumerate(spec.get("steps", [])):
                 for key in ("id", "prompt"):
                     if key not in st: problems.append(f"{os.path.basename(b)} step[{i}] 缺 {key}")
